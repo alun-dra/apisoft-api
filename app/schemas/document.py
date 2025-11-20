@@ -40,6 +40,7 @@ class DocumentRead(BaseModel):
     client_id: int
     emitter_id: int
     tipo_dte: int
+    folio: int | None = None
     monto_neto: float
     monto_iva: float
     monto_total: float

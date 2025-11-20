@@ -3,6 +3,7 @@ from .client import Client
 from .emitter import Emitter
 from .document import Document, DocumentItem
 from .log_event import LogEvent
+from .caf import Caf
 
 __all__ = [
     "Base",
@@ -11,4 +12,5 @@ __all__ = [
     "Document",
     "DocumentItem",
     "LogEvent",
+    "Caf",
 ]

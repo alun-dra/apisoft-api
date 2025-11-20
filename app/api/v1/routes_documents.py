@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.responses import PlainTextResponse
+from xml.dom import minidom
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -9,6 +11,7 @@ from app.models.client import Client
 from app.models.document import Document, DocumentItem
 from app.schemas.document import DocumentCreate, DocumentRead
 from app.services.sii_client import process_document_send_to_sii
+from app.services.caf_service import assign_folio_from_caf, NoAvailableFolio
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -20,9 +23,7 @@ def create_document(
     db: Session = Depends(get_db),
     current_client: Client = Depends(get_current_client),
 ):
-    from decimal import Decimal
-
-    # Calcular montos
+    # ---------- Cálculo de montos ----------
     monto_neto = Decimal("0")
     for item in payload.items:
         line_total = Decimal(str(item.cantidad)) * Decimal(str(item.precio_unitario))
@@ -33,11 +34,25 @@ def create_document(
     monto_iva = (monto_neto * Decimal("0.19")).quantize(Decimal("1."))  # IVA 19%
     monto_total = monto_neto + monto_iva
 
-    # Crear documento
+    # ---------- Asignar folio desde CAF ----------
+    try:
+        caf, folio = assign_folio_from_caf(
+            db,
+            emitter_id=payload.emitter_id,
+            tipo_dte=payload.tipo_dte,
+        )
+    except NoAvailableFolio as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    # ---------- Crear documento ----------
     document = Document(
         client_id=current_client.id,
         emitter_id=payload.emitter_id,
         tipo_dte=payload.tipo_dte,
+        folio=folio,  # 👈 ahora el documento tiene folio real
         receptor_rut=payload.receptor.rut,
         receptor_razon_social=payload.receptor.razon_social,
         receptor_direccion=payload.receptor.direccion,
@@ -51,7 +66,7 @@ def create_document(
     db.add(document)
     db.flush()  # para tener document.id
 
-    # Items
+    # ---------- Items ----------
     for item in payload.items:
         line_total = Decimal(str(item.cantidad)) * Decimal(str(item.precio_unitario))
         if item.descuento:
@@ -67,6 +82,10 @@ def create_document(
         )
         db.add(db_item)
 
+    # commit incluye:
+    # - documento
+    # - items
+    # - actualización de caf.folio_actual (hecha en assign_folio_from_caf)
     db.commit()
     db.refresh(document)
 
@@ -100,9 +119,6 @@ def get_document(
     return document
 
 
-
-from xml.dom import minidom
-
 @router.get("/{document_id}/xml", response_class=PlainTextResponse)
 def get_document_xml(
     document_id: int,
@@ -130,9 +146,7 @@ def get_document_xml(
             detail="XML not generated yet",
         )
 
-    # 🔥 Formatear XML bonito
     parsed = minidom.parseString(document.raw_xml.encode("iso-8859-1"))
     pretty_xml = parsed.toprettyxml(indent="  ")
 
     return pretty_xml
-

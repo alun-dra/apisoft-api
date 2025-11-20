@@ -3,6 +3,7 @@ from fastapi.openapi.utils import get_openapi
 
 from app.api.v1.routes_documents import router as documents_router
 from app.api.v1.routes_emitters import router as emitters_router
+from app.api.v1.routes_caf import router as caf_router  # 👈 NUEVO
 from app.db.session import Base, engine
 from app.core.config import get_settings
 
@@ -14,6 +15,7 @@ app = FastAPI(
     title=settings.app_name,
     debug=settings.debug,
 )
+
 
 # 🔥 AQUI AGREGAMOS EL ESQUEMA DE API KEY PARA SWAGGER
 def custom_openapi():
@@ -54,5 +56,7 @@ def health_check():
     return {"status": "ok"}
 
 
+# Routers
 app.include_router(emitters_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
+app.include_router(caf_router, prefix="/api/v1")  # 👈 NUEVO

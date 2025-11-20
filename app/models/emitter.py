@@ -21,3 +21,4 @@ class Emitter(Base):
 
     client = relationship("Client", back_populates="emitters")
     documents = relationship("Document", back_populates="emitter")
+    caf_list = relationship("Caf" ,back_populates="emitter", cascade="all, delete-orphan")

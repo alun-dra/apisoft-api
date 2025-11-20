@@ -27,6 +27,7 @@ def add_log(
     payload: dict | None = None,
 ) -> None:
     """Registra un evento en log_events."""
+    
     log = LogEvent(
         document_id=document.id if document else None,
         client_id=client_id,
@@ -35,8 +36,10 @@ def add_log(
         message=message,
         payload=json.dumps(payload, default=str) if payload is not None else None,
     )
+
     db.add(log)
     db.commit()
+
 
 
 # ---------- Construcción de XML DTE ----------
@@ -76,7 +79,7 @@ def build_dte_xml_33(document: Document) -> str:
     dte = ET.Element("DTE")
     dte.set("version", "1.0")
 
-    # ID del Documento, algo como F33T2 (puedes afinarlo luego)
+    # ID del Documento, algo como F33T{id_doc}
     doc_id = f"F33T{document.id}"
 
     # --- Documento ---
@@ -88,10 +91,15 @@ def build_dte_xml_33(document: Document) -> str:
 
     # IdDoc
     iddoc = ET.SubElement(encabezado, "IdDoc")
+
     tipo_dte_el = ET.SubElement(iddoc, "TipoDTE")
     tipo_dte_el.text = str(document.tipo_dte)
 
-    # Fecha emisión = hoy por ahora (podrías agregar campo específico en el modelo)
+    # 👉 Folio real desde CAF
+    folio_el = ET.SubElement(iddoc, "Folio")
+    folio_el.text = str(document.folio) if document.folio is not None else "0"
+
+    # Fecha emisión (por ahora usamos hoy)
     fch_emis_el = ET.SubElement(iddoc, "FchEmis")
     fch_emis_el.text = datetime.utcnow().date().isoformat()
 
@@ -192,11 +200,13 @@ def build_ted_placeholder(document: Document) -> ET.Element:
 
     dd = ET.SubElement(ted, "DD")
     # Aquí irían los tags reales del DD (RE, TD, F, FE, RR, etc.) según el CAF.
+
     td_el = ET.SubElement(dd, "TD")
     td_el.text = str(document.tipo_dte)
 
+    # 👉 Usar folio real del documento (no el id)
     f_el = ET.SubElement(dd, "F")
-    f_el.text = str(document.id)  # en real: folio DTE
+    f_el.text = str(document.folio) if document.folio is not None else "0"
 
     re_el = ET.SubElement(dd, "RE")
     re_el.text = document.emitter.rut_emisor

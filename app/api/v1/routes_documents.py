@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import PlainTextResponse
 from xml.dom import minidom
 from decimal import Decimal
+import logging
 
 from sqlalchemy.orm import Session
 
@@ -13,13 +14,14 @@ from app.schemas.document import DocumentCreate, DocumentRead
 from app.services.sii_client import process_document_send_to_sii
 from app.services.caf_service import assign_folio_from_caf, NoAvailableFolio
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 @router.post("/", response_model=DocumentRead, status_code=status.HTTP_201_CREATED)
 def create_document(
     payload: DocumentCreate,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_client: Client = Depends(get_current_client),
 ):
@@ -52,7 +54,7 @@ def create_document(
         client_id=current_client.id,
         emitter_id=payload.emitter_id,
         tipo_dte=payload.tipo_dte,
-        folio=folio,  # 👈 ahora el documento tiene folio real
+        folio=folio,  # folio real desde CAF
         receptor_rut=payload.receptor.rut,
         receptor_razon_social=payload.receptor.razon_social,
         receptor_direccion=payload.receptor.direccion,
@@ -82,15 +84,23 @@ def create_document(
         )
         db.add(db_item)
 
-    # commit incluye:
-    # - documento
-    # - items
-    # - actualización de caf.folio_actual (hecha en assign_folio_from_caf)
+    # commit incluye documento, items y actualización de caf.folio_actual
     db.commit()
     db.refresh(document)
 
-    # 🔥 Encolar envío al SII (por ahora dummy) como tarea en background
-    background_tasks.add_task(process_document_send_to_sii, document.id)
+    # 🔥 Enviar al “SII” (dummy/real según sii_client.py) de forma síncrona
+    try:
+        process_document_send_to_sii(document.id)
+        db.refresh(document)  # para traer raw_xml, sii_state, sii_track_id, etc.
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Error al procesar envío a SII para document_id=%s", document.id
+        )
+        # No botamos el documento, solo marcamos error
+        document.sii_state = "ERROR"
+        document.error_last_message = str(exc)
+        db.commit()
+        db.refresh(document)
 
     return document
 
@@ -140,13 +150,26 @@ def get_document_xml(
             detail="Document not found",
         )
 
-    if not document.raw_xml:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="XML not generated yet",
+    # Si el XML ya existe → lo devolvemos
+    if document.raw_xml:
+        parsed = minidom.parseString(document.raw_xml.encode("iso-8859-1"))
+        return parsed.toprettyxml(indent="  ")
+
+    # ---------- Intentar generarlo usando el mismo flujo del envío ----------
+    try:
+        process_document_send_to_sii(document.id)
+        db.refresh(document)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Error al regenerar XML para document_id=%s: %s", document.id, exc
         )
 
-    parsed = minidom.parseString(document.raw_xml.encode("iso-8859-1"))
-    pretty_xml = parsed.toprettyxml(indent="  ")
+    if document.raw_xml:
+        parsed = minidom.parseString(document.raw_xml.encode("iso-8859-1"))
+        return parsed.toprettyxml(indent="  ")
 
-    return pretty_xml
+    # ---------- Si después de todo no se pudo generar ----------
+    raise HTTPException(
+        status_code=500,
+        detail="XML could not be generated",
+    )

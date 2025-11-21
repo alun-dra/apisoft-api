@@ -4,14 +4,19 @@ from datetime import datetime
 import uuid
 import json
 import xml.etree.ElementTree as ET
-from typing import Callable
+from typing import Callable, Optional
+from copy import deepcopy
 
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
 from app.models.document import Document
 from app.models.log_event import LogEvent
-
+from app.services.caf_service import (
+    CafParsed,
+    get_caf_for_document,
+    parse_caf_xml,
+)
 
 # ---------- Helpers de logging ----------
 
@@ -19,15 +24,14 @@ from app.models.log_event import LogEvent
 def add_log(
     db: Session,
     *,
-    document: Document | None,
-    client_id: int | None,
+    document: Optional[Document],
+    client_id: Optional[int],
     level: str = "INFO",
     origin: str = "INTERNAL",
     message: str,
-    payload: dict | None = None,
+    payload: Optional[dict] = None,
 ) -> None:
     """Registra un evento en log_events."""
-    
     log = LogEvent(
         document_id=document.id if document else None,
         client_id=client_id,
@@ -36,26 +40,24 @@ def add_log(
         message=message,
         payload=json.dumps(payload, default=str) if payload is not None else None,
     )
-
     db.add(log)
     db.commit()
-
 
 
 # ---------- Construcción de XML DTE ----------
 
 
-def build_dte_xml(document: Document) -> str:
+def build_dte_xml(document: Document, caf_parsed: Optional[CafParsed]) -> str:
     """
     Punto de entrada para construir el XML del DTE.
 
     Según el tipo de DTE, delega en la función correspondiente.
     Así, si el formato de un documento cambia, solo tocas su función.
     """
-    builders: dict[int, Callable[[Document], str]] = {
+    builders: dict[int, Callable[[Document, Optional[CafParsed]], str]] = {
         33: build_dte_xml_33,
-        # 34: build_dte_xml_34,   # factura exenta (a futuro)
-        # 39: build_dte_xml_boleta,  # boleta afecta
+        # 34: build_dte_xml_34,
+        # 39: build_dte_xml_boleta,
         # 41: build_dte_xml_boleta_exenta,
         # 56: build_dte_xml_nota_debito,
         # 61: build_dte_xml_nota_credito,
@@ -65,14 +67,13 @@ def build_dte_xml(document: Document) -> str:
     if not builder:
         raise ValueError(f"Tipo DTE no soportado aún: {document.tipo_dte}")
 
-    return builder(document)
+    return builder(document, caf_parsed)
 
 
-def build_dte_xml_33(document: Document) -> str:
+def build_dte_xml_33(document: Document, caf_parsed: Optional[CafParsed]) -> str:
     """
     Construye un DTE de tipo 33 (Factura Afecta) con estructura similar al formato SII.
-    Incluye TED placeholder y TmstFirma. En producción deberás reemplazar el
-    TED por uno generado usando el CAF real.
+    Incluye TED (estructura real) y TmstFirma.
     """
 
     # --- Nodo raíz DTE ---
@@ -95,11 +96,11 @@ def build_dte_xml_33(document: Document) -> str:
     tipo_dte_el = ET.SubElement(iddoc, "TipoDTE")
     tipo_dte_el.text = str(document.tipo_dte)
 
-    # 👉 Folio real desde CAF
+    # Folio real desde CAF
     folio_el = ET.SubElement(iddoc, "Folio")
     folio_el.text = str(document.folio) if document.folio is not None else "0"
 
-    # Fecha emisión (por ahora usamos hoy)
+    # Fecha emisión
     fch_emis_el = ET.SubElement(iddoc, "FchEmis")
     fch_emis_el.text = datetime.utcnow().date().isoformat()
 
@@ -153,88 +154,126 @@ def build_dte_xml_33(document: Document) -> str:
     mnt_total_el.text = str(int(document.monto_total))
 
     # --- Detalle(s) ---
-    # Un <Detalle> por cada item del documento
     for idx, item in enumerate(document.items, start=1):
         detalle = ET.SubElement(documento, "Detalle")
 
-        # NroLinDet es requerido
         nro_lin_det_el = ET.SubElement(detalle, "NroLinDet")
         nro_lin_det_el.text = str(idx)
 
-        # Descripción
         nmb_item_el = ET.SubElement(detalle, "NmbItem")
         nmb_item_el.text = item.descripcion
 
-        # Cantidad
         qty_el = ET.SubElement(detalle, "QtyItem")
         qty_el.text = str(item.cantidad)
 
-        # Precio unitario
         prc_item_el = ET.SubElement(detalle, "PrcItem")
         prc_item_el.text = str(item.precio_unitario)
 
-        # Descuento (si aplica)
         if item.descuento and item.descuento != 0:
             desc_monto_el = ET.SubElement(detalle, "DescuentoMonto")
             desc_monto_el.text = str(item.descuento)
 
-        # Monto de la línea
         monto_item_el = ET.SubElement(detalle, "MontoItem")
         monto_item_el.text = str(int(item.total_linea))
 
-    # 👉 Agregar TED (placeholder) y TmstFirma
-    add_ted_and_timestamp(documento, document)
+    # TED + TmstFirma
+    add_ted_real_and_timestamp(documento, document, caf_parsed)
 
-    # Serializar con encoding ISO-8859-1, como pide el SII
+    # Serializar con encoding ISO-8859-1
     xml_bytes = ET.tostring(dte, encoding="iso-8859-1", xml_declaration=True)
     return xml_bytes.decode("iso-8859-1")
 
 
-def build_ted_placeholder(document: Document) -> ET.Element:
+# ---------- TED REAL (estructura) ----------
+
+
+def build_ted_real(document: Document, caf_parsed: Optional[CafParsed]) -> ET.Element:
     """
-    Construye un TED de ejemplo / placeholder.
-    En producción debes reemplazar esto con la generación real usando el CAF.
+    Construye el TED con estructura real:
+    <TED>
+      <DD>...</DD>
+      <FRMA algoritmo="SHA1withRSA">...</FRMA>
+    </TED>
+    FRMA queda como PLACEHOLDER por ahora.
     """
+
     ted = ET.Element("TED")
     ted.set("version", "1.0")
 
     dd = ET.SubElement(ted, "DD")
-    # Aquí irían los tags reales del DD (RE, TD, F, FE, RR, etc.) según el CAF.
 
+    # RE: RUT emisor
+    re_text = (
+        caf_parsed.rut_emisor
+        if caf_parsed and caf_parsed.rut_emisor
+        else document.emitter.rut_emisor
+    )
+    re_el = ET.SubElement(dd, "RE")
+    re_el.text = re_text
+
+    # TD: tipo DTE
     td_el = ET.SubElement(dd, "TD")
     td_el.text = str(document.tipo_dte)
 
-    # 👉 Usar folio real del documento (no el id)
+    # F: folio DTE
     f_el = ET.SubElement(dd, "F")
     f_el.text = str(document.folio) if document.folio is not None else "0"
 
-    re_el = ET.SubElement(dd, "RE")
-    re_el.text = document.emitter.rut_emisor
+    # FE: fecha emisión AAAAMMDD
+    fe_el = ET.SubElement(dd, "FE")
+    fe_el.text = datetime.utcnow().date().strftime("%Y%m%d")
 
+    # RR: RUT receptor
     rr_el = ET.SubElement(dd, "RR")
     rr_el.text = document.receptor_rut
 
+    # RSR: razón social receptor (máx 40 chars, mayúsculas)
+    rsr_el = ET.SubElement(dd, "RSR")
+    rsr_el.text = (document.receptor_razon_social or "")[:40].upper()
+
+    # MNT: monto total
     mnt_el = ET.SubElement(dd, "MNT")
     mnt_el.text = str(int(document.monto_total))
 
-    # Aquí iría FRMA (firma del DD con la llave del CAF)
+    # IT1: descripción principal (primer item, 40 chars)
+    it1_el = ET.SubElement(dd, "IT1")
+    if document.items:
+        it1_el.text = document.items[0].descripcion[:40]
+    else:
+        it1_el.text = "SIN DETALLE"
+
+    # CAF dentro del DD (si se pudo parsear)
+    if caf_parsed:
+        try:
+            root = ET.fromstring(caf_parsed.raw_xml)
+            caf_el = root.find(".//CAF")
+            if caf_el is not None:
+                dd.append(deepcopy(caf_el))
+        except Exception:
+            # si el XML del CAF está malo, seguimos sin él
+            pass
+
+    # TSTED: timestamp del TED
+    tsted_el = ET.SubElement(dd, "TSTED")
+    tsted_el.text = datetime.utcnow().replace(microsecond=0).isoformat()
+
+    # FRMA: firma DD (placeholder)
     frma_el = ET.SubElement(ted, "FRMA")
     frma_el.set("algoritmo", "SHA1withRSA")
-    frma_el.text = "PLACEHOLDER"  # aquí debe ir la firma real del DD
+    frma_el.text = "PLACEHOLDER"
 
     return ted
 
 
-def add_ted_and_timestamp(documento_el: ET.Element, document: Document) -> None:
-    """
-    Inserta el nodo TED y TmstFirma dentro del <Documento>.
-    documento_el es el nodo <Documento> que ya tiene Encabezado + Detalle.
-    """
-    # TED
-    ted_el = build_ted_placeholder(document)
+def add_ted_real_and_timestamp(
+    documento_el: ET.Element,
+    document: Document,
+    caf_parsed: Optional[CafParsed],
+) -> None:
+    """Inserta TED y TmstFirma dentro del <Documento>."""
+    ted_el = build_ted_real(document, caf_parsed)
     documento_el.append(ted_el)
 
-    # TmstFirma (timestamp de firma)
     tmst_firma_el = ET.SubElement(documento_el, "TmstFirma")
     tmst_firma_el.text = datetime.utcnow().replace(microsecond=0).isoformat()
 
@@ -243,29 +282,27 @@ def add_ted_and_timestamp(documento_el: ET.Element, document: Document) -> None:
 
 
 def send_xml_to_sii_dummy(xml_str: str) -> str:
-    """
-    Simula el envío del DTE al SII y devuelve un track_id ficticio.
-    Luego conectaremos esto al endpoint real del SII.
-    """
+    """Simula el envío del DTE al SII y devuelve un track_id ficticio."""
     fake_track_id = uuid.uuid4().hex[:12].upper()
     return fake_track_id
 
 
-def process_document_send_to_sii(document_id: int) -> None:
+def process_document_send_to_sii(document_id: int, *, raise_on_error: bool = True) -> None:
     """
-    Función pensada para ejecutarse en background.
+    Procesa y envía un documento al SII (dummy).
     - Abre su propia sesión
     - Carga el Document
-    - Genera XML (build_dte_xml)
+    - Busca el CAF correspondiente al folio
+    - Genera XML (build_dte_xml con TED real)
     - 'Envía' al SII (dummy)
     - Actualiza estado y track_id
     - Loggea todo
+    Si raise_on_error=True, cualquier error se relanza después de loguearse.
     """
     db = SessionLocal()
     try:
         document = db.query(Document).filter(Document.id == document_id).first()
         if not document:
-            # no hay log porque no tenemos client_id, pero dejamos constancia
             return
 
         client_id = document.client_id
@@ -279,9 +316,35 @@ def process_document_send_to_sii(document_id: int) -> None:
             message="Iniciando construcción de XML DTE",
         )
 
-        # 🔥 Aquí llamamos al generador general, que decide según tipo_dte
-        xml_str = build_dte_xml(document)
+        # Buscar CAF para este documento (por folio en rango)
+        caf = get_caf_for_document(db, document)
+        caf_parsed: Optional[CafParsed] = None
 
+        if caf:
+            try:
+                caf_parsed = parse_caf_xml(caf)
+            except Exception as caf_exc:  # error al parsear CAF
+                add_log(
+                    db,
+                    document=document,
+                    client_id=client_id,
+                    level="WARNING",
+                    origin="SII",
+                    message=f"Error al parsear CAF, se generará TED sin CAF incrustado: {caf_exc}",
+                )
+                caf_parsed = None
+        else:
+            add_log(
+                db,
+                document=document,
+                client_id=client_id,
+                level="WARNING",
+                origin="SII",
+                message="No se encontró CAF para el documento; TED se generará sin CAF incrustado",
+            )
+
+        # Generar XML
+        xml_str = build_dte_xml(document, caf_parsed)
         document.raw_xml = xml_str
 
         add_log(
@@ -295,7 +358,6 @@ def process_document_send_to_sii(document_id: int) -> None:
 
         # Simulación de envío al SII
         track_id = send_xml_to_sii_dummy(xml_str)
-
         document.sii_track_id = track_id
         document.sii_state = "ENVIADO"
 
@@ -313,7 +375,6 @@ def process_document_send_to_sii(document_id: int) -> None:
 
     except Exception as exc:  # noqa: BLE001
         db.rollback()
-        # Intentamos loggear el error si alcanzamos a tener el document
         try:
             document = db.query(Document).filter(Document.id == document_id).first()
             client_id = document.client_id if document else None
@@ -325,8 +386,9 @@ def process_document_send_to_sii(document_id: int) -> None:
                 origin="SII",
                 message=f"Error al procesar envío a SII: {exc}",
             )
-        except Exception:
-            # si hasta el log falla, ya fue, pero no queremos romper más
-            pass
+        finally:
+            if raise_on_error:
+                # muy importante: relanzar para que el POST falle y sepamos que algo está mal
+                raise
     finally:
         db.close()

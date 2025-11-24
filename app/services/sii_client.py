@@ -1,3 +1,4 @@
+# app/services/sii_client.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,8 +7,16 @@ import json
 import xml.etree.ElementTree as ET
 from typing import Callable, Optional
 from copy import deepcopy
+from functools import lru_cache
+import base64
 
 from sqlalchemy.orm import Session
+
+from cryptography.hazmat.primitives.serialization.pkcs12 import (
+    load_key_and_certificates,
+)
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from app.db.session import SessionLocal
 from app.models.document import Document
@@ -17,6 +26,10 @@ from app.services.caf_service import (
     get_caf_for_document,
     parse_caf_xml,
 )
+from app.services.envio_dte import build_envio_dte_xml, send_envio_dte_dummy
+from app.core.config import get_settings
+
+settings = get_settings()
 
 # ---------- Helpers de logging ----------
 
@@ -44,6 +57,65 @@ def add_log(
     db.commit()
 
 
+# ---------- Carga de la llave desde el .pfx (opcional) ----------
+
+
+@lru_cache
+def _get_signing_key():
+    """
+    Devuelve la private key RSA del .pfx si:
+    - enable_real_signature = True
+    - la ruta y password son válidas
+
+    Si algo falla -> devuelve None y seguimos con PLACEHOLDER.
+    """
+    if not settings.enable_real_signature:
+        return None
+
+    if not settings.sii_cert_pfx_path:
+        return None
+
+    try:
+        with open(settings.sii_cert_pfx_path, "rb") as f:
+            pfx_data = f.read()
+
+        password_bytes = (
+            settings.sii_cert_pfx_password.encode("utf-8")
+            if settings.sii_cert_pfx_password
+            else None
+        )
+
+        private_key, cert, _ = load_key_and_certificates(
+            pfx_data,
+            password_bytes,
+        )
+        return private_key
+    except Exception:
+        # Si falla la carga, no rompemos el flujo
+        return None
+
+
+def sign_dd_with_cert(dd_element: ET.Element) -> Optional[str]:
+    """
+    Firma el nodo <DD> con SHA1withRSA usando la llave del .pfx.
+    Devuelve el Base64 para poner en <FRMA>, o None si no se pudo firmar.
+    """
+    key = _get_signing_key()
+    if key is None:
+        return None
+
+    # Canonicalización simple (para pruebas)
+    dd_c14n = ET.tostring(dd_element, encoding="utf-8")
+
+    signature = key.sign(
+        dd_c14n,
+        padding.PKCS1v15(),
+        hashes.SHA1(),  # SII usa SHA1withRSA
+    )
+
+    return base64.b64encode(signature).decode("ascii")
+
+
 # ---------- Construcción de XML DTE ----------
 
 
@@ -52,15 +124,10 @@ def build_dte_xml(document: Document, caf_parsed: Optional[CafParsed]) -> str:
     Punto de entrada para construir el XML del DTE.
 
     Según el tipo de DTE, delega en la función correspondiente.
-    Así, si el formato de un documento cambia, solo tocas su función.
     """
     builders: dict[int, Callable[[Document, Optional[CafParsed]], str]] = {
         33: build_dte_xml_33,
-        # 34: build_dte_xml_34,
-        # 39: build_dte_xml_boleta,
-        # 41: build_dte_xml_boleta_exenta,
-        # 56: build_dte_xml_nota_debito,
-        # 61: build_dte_xml_nota_credito,
+        # Aquí podrías agregar otros tipos: 34, 39, 41, 56, 61, etc.
     }
 
     builder = builders.get(document.tipo_dte)
@@ -72,7 +139,7 @@ def build_dte_xml(document: Document, caf_parsed: Optional[CafParsed]) -> str:
 
 def build_dte_xml_33(document: Document, caf_parsed: Optional[CafParsed]) -> str:
     """
-    Construye un DTE de tipo 33 (Factura Afecta) con estructura similar al formato SII.
+    Construye un DTE de tipo 33 (Factura Afecta).
     Incluye TED (estructura real) y TmstFirma.
     """
 
@@ -189,12 +256,11 @@ def build_dte_xml_33(document: Document, caf_parsed: Optional[CafParsed]) -> str
 
 def build_ted_real(document: Document, caf_parsed: Optional[CafParsed]) -> ET.Element:
     """
-    Construye el TED con estructura real:
+    Construye el TED real:
     <TED>
       <DD>...</DD>
       <FRMA algoritmo="SHA1withRSA">...</FRMA>
     </TED>
-    FRMA queda como PLACEHOLDER por ahora.
     """
 
     ted = ET.Element("TED")
@@ -257,10 +323,15 @@ def build_ted_real(document: Document, caf_parsed: Optional[CafParsed]) -> ET.El
     tsted_el = ET.SubElement(dd, "TSTED")
     tsted_el.text = datetime.utcnow().replace(microsecond=0).isoformat()
 
-    # FRMA: firma DD (placeholder)
+    # FRMA: firma DD (real o placeholder)
     frma_el = ET.SubElement(ted, "FRMA")
     frma_el.set("algoritmo", "SHA1withRSA")
-    frma_el.text = "PLACEHOLDER"
+
+    frma_value = sign_dd_with_cert(dd)
+    if frma_value:
+        frma_el.text = frma_value
+    else:
+        frma_el.text = "PLACEHOLDER"
 
     return ted
 
@@ -278,27 +349,22 @@ def add_ted_real_and_timestamp(
     tmst_firma_el.text = datetime.utcnow().replace(microsecond=0).isoformat()
 
 
-# ---------- Simulación de envío al SII ----------
-
-
-def send_xml_to_sii_dummy(xml_str: str) -> str:
-    """Simula el envío del DTE al SII y devuelve un track_id ficticio."""
-    fake_track_id = uuid.uuid4().hex[:12].upper()
-    return fake_track_id
+# ---------- Flujo principal: DTE + EnvioDTE DUMMY ----------
 
 
 def process_document_send_to_sii(document_id: int, *, raise_on_error: bool = True) -> None:
     """
-    Procesa y envía un documento al SII (dummy).
+    Procesa y 'envía' un documento al SII (modo dummy):
     - Abre su propia sesión
     - Carga el Document
     - Busca el CAF correspondiente al folio
-    - Genera XML (build_dte_xml con TED real)
-    - 'Envía' al SII (dummy)
+    - Genera XML DTE (con TED real firmado si hay .pfx)
+    - Genera sobre EnvioDTE (Carátula + SetDTE)
+    - 'Envía' el EnvioDTE con send_envio_dte_dummy (sin HTTP real)
     - Actualiza estado y track_id
     - Loggea todo
-    Si raise_on_error=True, cualquier error se relanza después de loguearse.
     """
+    
     db = SessionLocal()
     try:
         document = db.query(Document).filter(Document.id == document_id).first()
@@ -343,9 +409,9 @@ def process_document_send_to_sii(document_id: int, *, raise_on_error: bool = Tru
                 message="No se encontró CAF para el documento; TED se generará sin CAF incrustado",
             )
 
-        # Generar XML
-        xml_str = build_dte_xml(document, caf_parsed)
-        document.raw_xml = xml_str
+        # Generar XML DTE
+        dte_xml = build_dte_xml(document, caf_parsed)
+        document.raw_xml = dte_xml
 
         add_log(
             db,
@@ -356,8 +422,25 @@ def process_document_send_to_sii(document_id: int, *, raise_on_error: bool = Tru
             message="XML DTE generado",
         )
 
-        # Simulación de envío al SII
-        track_id = send_xml_to_sii_dummy(xml_str)
+        # Generar EnvioDTE (sobre)
+        envio_xml = build_envio_dte_xml(
+            dte_xml=dte_xml,
+            tipo_dte=document.tipo_dte,
+            rut_emisor=document.emitter.rut_emisor,
+        )
+        document.envio_xml = envio_xml  # <<< guardar el sobre
+
+        add_log(
+            db,
+            document=document,
+            client_id=client_id,
+            level="INFO",
+            origin="SII",
+            message="EnvioDTE generado (dummy)",
+        )
+
+        # 'Enviar' al SII (dummy)
+        track_id = send_envio_dte_dummy(envio_xml)
         document.sii_track_id = track_id
         document.sii_state = "ENVIADO"
 
@@ -367,7 +450,7 @@ def process_document_send_to_sii(document_id: int, *, raise_on_error: bool = Tru
             client_id=client_id,
             level="INFO",
             origin="SII",
-            message="Documento enviado al SII (dummy)",
+            message="EnvioDTE enviado al SII (dummy)",
             payload={"track_id": track_id},
         )
 
@@ -388,7 +471,6 @@ def process_document_send_to_sii(document_id: int, *, raise_on_error: bool = Tru
             )
         finally:
             if raise_on_error:
-                # muy importante: relanzar para que el POST falle y sepamos que algo está mal
                 raise
     finally:
         db.close()

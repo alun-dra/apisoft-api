@@ -59,4 +59,4 @@ def health_check():
 # Routers
 app.include_router(emitters_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
-app.include_router(caf_router, prefix="/api/v1")  # 👈 NUEVO
+app.include_router(caf_router, prefix="/api/v1")  

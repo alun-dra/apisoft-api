@@ -173,3 +173,16 @@ def get_document_xml(
         status_code=500,
         detail="XML could not be generated",
     )
+
+
+
+@router.get("/{document_id}/envio-xml", response_class=PlainTextResponse)
+def get_envio_xml(document_id: int, db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(404, "Documento no encontrado")
+
+    if not doc.envio_xml:
+        raise HTTPException(404, "EnvioDTE aún no generado")
+
+    return doc.envio_xml

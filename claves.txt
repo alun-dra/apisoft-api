@@ -1,2 +1,6 @@
 YVeDzc-FbDokpVfsNRbUeFUhrPGjPN-VKR3o8G4XNjs
 
+"""generar certificado local win""""
+
+
+uvicorn app.main:app --reload

@@ -17,7 +17,7 @@ class Document(Base):
     client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
     emitter_id = Column(Integer, ForeignKey("emitters.id"), nullable=False)
 
-    tipo_dte = Column(Integer, nullable=False)  # 33, 34, 39, etc.
+    tipo_dte = Column(Integer, nullable=False)
     folio = Column(Integer, nullable=True)
 
     receptor_rut = Column(String(20), nullable=False)
@@ -34,6 +34,7 @@ class Document(Base):
     error_last_message = Column(Text, nullable=True)
 
     raw_xml = Column(Text, nullable=True)
+    envio_xml = Column(Text, nullable=True)   # <--- NUEVO
     pdf_path = Column(String(255), nullable=True)
 
     client = relationship("Client", back_populates="documents")

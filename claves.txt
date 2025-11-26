@@ -1,6 +1,30 @@
 YVeDzc-FbDokpVfsNRbUeFUhrPGjPN-VKR3o8G4XNjs
 
-"""generar certificado local win""""
 
 
+////////////////////iniciar servidor/////////////////////
 uvicorn app.main:app --reload
+
+
+POST /api/v1/documents/
+{
+  "client_id": 1,
+  "emitter_id": 1,
+  "tipo_dte": 33,
+  "receptor": {
+    "rut": "11.111.111-1",
+    "razon_social": "Cliente Prueba",
+    "direccion": "Av. Chile 123",
+    "comuna": "Santiago"
+  },
+  "monto_neto": 1000,
+  "monto_iva": 190,
+  "monto_total": 1190,
+  "items": [
+    {
+      "descripcion": "Servicio X",
+      "cantidad": 1,
+      "precio_unitario": 1000
+    }
+  ]
+}

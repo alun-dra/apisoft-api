@@ -84,18 +84,27 @@ def build_envio_dte_xml(*, dte_xml: str, tipo_dte: int, rut_emisor: str) -> str:
     signature = ET.SubElement(envio, f"{DS}Signature")
 
     signed_info = ET.SubElement(signature, f"{DS}SignedInfo")
+
+    # CanonicalizationMethod con Algorithm fijo según xmldsignature_v10.xsd
     ET.SubElement(
         signed_info,
         f"{DS}CanonicalizationMethod",
         Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
     )
+
+    # SignatureMethod con Algorithm dentro del enum permitido
     ET.SubElement(
         signed_info,
         f"{DS}SignatureMethod",
         Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1",
     )
 
-    ref = ET.SubElement(signed_info, f"{DS}Reference", URI="")
+    # Reference con URI requerido, apuntando al SetDTE por ID
+    ref = ET.SubElement(
+        signed_info,
+        f"{DS}Reference",
+        URI=f"#{set_id}",
+    )
     ET.SubElement(
         ref,
         f"{DS}DigestMethod",
@@ -104,11 +113,21 @@ def build_envio_dte_xml(*, dte_xml: str, tipo_dte: int, rut_emisor: str) -> str:
     # base64 dummy válido
     ET.SubElement(ref, f"{DS}DigestValue").text = "AA=="
 
+    # SignatureValue base64 dummy
     ET.SubElement(signature, f"{DS}SignatureValue").text = "AA=="
 
+    # KeyInfo con KeyValue(RSA) + X509Data en el orden que define el XSD
     key_info = ET.SubElement(signature, f"{DS}KeyInfo")
+
+    # KeyValue -> RSAKeyValue -> Modulus / Exponent
+    key_value = ET.SubElement(key_info, f"{DS}KeyValue")
+    rsa_key_value = ET.SubElement(key_value, f"{DS}RSAKeyValue")
+    ET.SubElement(rsa_key_value, f"{DS}Modulus").text = "AA=="   # dummy base64
+    ET.SubElement(rsa_key_value, f"{DS}Exponent").text = "AA=="  # dummy base64
+
+    # X509Data -> X509Certificate
     x509 = ET.SubElement(key_info, f"{DS}X509Data")
-    ET.SubElement(x509, f"{DS}X509Certificate").text = "AA=="
+    ET.SubElement(x509, f"{DS}X509Certificate").text = "AA=="  # dummy base64
 
     # ---------- Serializar ----------
     envio_bytes = ET.tostring(envio, encoding="iso-8859-1", xml_declaration=True)

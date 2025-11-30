@@ -161,6 +161,47 @@ def sign_dd_with_cert(dd_element: ET.Element) -> Optional[str]:
     return base64.b64encode(signature).decode("ascii")
 
 
+# ---------- CAF FAKE PARA DEV ----------
+
+
+def build_fake_caf_for_document(document: Document) -> ET.Element:
+    """
+    Construye un CAF 'fake' solo para desarrollo, con la estructura mínima
+    compatible con el XSD, usando datos del documento.
+    NO es válido para producción real.
+    """
+    caf_el = ET.Element(sii("CAF"))
+    caf_el.set("version", "1.0")
+
+    da = ET.SubElement(caf_el, sii("DA"))
+    ET.SubElement(da, sii("RE")).text = normalize_rut(document.emitter.rut_emisor)
+    ET.SubElement(da, sii("RS")).text = (document.emitter.razon_social or "")[:100]
+    ET.SubElement(da, sii("TD")).text = str(document.tipo_dte)
+
+    rng = ET.SubElement(da, sii("RNG"))
+    folio = document.folio if document.folio is not None else 1
+    ET.SubElement(rng, sii("D")).text = str(folio)
+    ET.SubElement(rng, sii("H")).text = str(folio)
+
+    # Fecha de autorización (fake)
+    ET.SubElement(da, sii("FA")).text = datetime.utcnow().date().isoformat()
+
+    # RSAPK requerido por el XSD (estructura con M/E)
+    rsapk = ET.SubElement(da, sii("RSAPK"))
+    ET.SubElement(rsapk, sii("M")).text = "AA=="  # Modulus dummy (base64)
+    ET.SubElement(rsapk, sii("E")).text = "AA=="  # Exponent dummy (base64)
+
+    # IDK requerido por el XSD (xs:long) → usamos valor numérico
+    ET.SubElement(da, sii("IDK")).text = "1"
+
+    # FRMA con atributo algoritmo requerido
+    frma = ET.SubElement(caf_el, sii("FRMA"))
+    frma.set("algoritmo", "SHA1withRSA")
+    frma.text = "AA=="  # dummy base64
+
+    return caf_el
+
+
 # ---------- Construcción de XML DTE ----------
 
 
@@ -228,10 +269,9 @@ def build_dte_xml_33(document: Document, caf_parsed: Optional[CafParsed]) -> str
         giro_emis_el = ET.SubElement(emisor, sii("GiroEmis"))
         giro_emis_el.text = document.emitter.giro
 
-    # Para satisfacer el XSD: Telefono/CorreoEmisor/Acteco pueden ir aquí.
-    # Usamos Acteco dummy por ahora.
+    # Acteco dummy numérico válido
     acteco_el = ET.SubElement(emisor, sii("Acteco"))
-    acteco_el.text = "000000"
+    acteco_el.text = "123456"
 
     if document.emitter.direccion:
         dir_origen_el = ET.SubElement(emisor, sii("DirOrigen"))
@@ -296,34 +336,55 @@ def build_dte_xml_33(document: Document, caf_parsed: Optional[CafParsed]) -> str
     # TED + TmstFirma
     add_ted_real_and_timestamp(documento, document, caf_parsed)
 
-    # Firma dummy dentro del DTE para que el XSD no reclame Signature
+    # ---------- Firma dummy dentro del DTE (XSD-compatible) ----------
     signature = ET.SubElement(dte, f"{DS}Signature")
 
     signed_info = ET.SubElement(signature, f"{DS}SignedInfo")
+
+    # CanonicalizationMethod con Algorithm fijo según xmldsignature_v10.xsd
     ET.SubElement(
         signed_info,
         f"{DS}CanonicalizationMethod",
         Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
     )
+
+    # SignatureMethod con Algorithm dentro del enum permitido
     ET.SubElement(
         signed_info,
         f"{DS}SignatureMethod",
         Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1",
     )
 
-    ref = ET.SubElement(signed_info, f"{DS}Reference", URI="")
+    # Reference con URI requerido (apuntando al Documento por ID)
+    ref = ET.SubElement(
+        signed_info,
+        f"{DS}Reference",
+        URI=f"#{doc_id}",
+    )
+
+    # DigestMethod fijo y DigestValue base64 válido
     ET.SubElement(
         ref,
         f"{DS}DigestMethod",
         Algorithm="http://www.w3.org/2000/09/xmldsig#sha1",
     )
-    # base64 dummy válido
-    ET.SubElement(ref, f"{DS}DigestValue").text = "AA=="
+    ET.SubElement(ref, f"{DS}DigestValue").text = "AA=="  # dummy base64
 
+    # SignatureValue base64
     ET.SubElement(signature, f"{DS}SignatureValue").text = "AA=="
 
+    # KeyInfo con KeyValue (RSA) + X509Data, en el orden que define el XSD
     key_info = ET.SubElement(signature, f"{DS}KeyInfo")
-    ET.SubElement(key_info, f"{DS}KeyValue")  # estructura mínima compatible con XSD
+
+    # KeyValue -> RSAKeyValue -> Modulus / Exponent
+    key_value = ET.SubElement(key_info, f"{DS}KeyValue")
+    rsa_key_value = ET.SubElement(key_value, f"{DS}RSAKeyValue")
+    ET.SubElement(rsa_key_value, f"{DS}Modulus").text = "AA=="   # dummy base64
+    ET.SubElement(rsa_key_value, f"{DS}Exponent").text = "AA=="  # dummy base64
+
+    # X509Data -> X509Certificate
+    x509 = ET.SubElement(key_info, f"{DS}X509Data")
+    ET.SubElement(x509, f"{DS}X509Certificate").text = "AA=="  # dummy base64
 
     # Serializar con encoding ISO-8859-1
     xml_bytes = ET.tostring(dte, encoding="iso-8859-1", xml_declaration=True)
@@ -387,16 +448,23 @@ def build_ted_real(document: Document, caf_parsed: Optional[CafParsed]) -> ET.El
     else:
         it1_el.text = "SIN DETALLE"
 
-    # CAF dentro del DD (si se pudo parsear)
-    if caf_parsed:
+    # CAF dentro del DD (real si existe, si no usamos uno fake para dev)
+    caf_el_to_append: Optional[ET.Element] = None
+
+    if caf_parsed and getattr(caf_parsed, "raw_xml", None):
         try:
             root = ET.fromstring(caf_parsed.raw_xml)
-            caf_el = root.find(".//CAF")
-            if caf_el is not None:
-                dd.append(deepcopy(caf_el))
+            caf_el_to_append = root.find(".//CAF")
+            if caf_el_to_append is None:
+                caf_el_to_append = root.find(".//" + sii("CAF"))
         except Exception:
-            # si el XML del CAF está malo, seguimos sin él
-            pass
+            caf_el_to_append = None
+
+    if caf_el_to_append is None:
+        # No hay CAF real → usamos uno fake solo para desarrollo
+        caf_el_to_append = build_fake_caf_for_document(document)
+
+    dd.append(deepcopy(caf_el_to_append))
 
     # TSTED: timestamp del TED
     tsted_el = ET.SubElement(dd, sii("TSTED"))
@@ -481,7 +549,7 @@ def process_document_send_to_sii(
                     level="WARNING",
                     origin="SII",
                     message=(
-                        "Error al parsear CAF, se generará TED sin CAF incrustado: "
+                        "Error al parsear CAF, se usará CAF fake en TED: "
                         f"{caf_exc}"
                     ),
                 )
@@ -495,7 +563,7 @@ def process_document_send_to_sii(
                 origin="SII",
                 message=(
                     "No se encontró CAF para el documento; "
-                    "TED se generará sin CAF incrustado"
+                    "se usará CAF fake en TED (solo dev)"
                 ),
             )
 

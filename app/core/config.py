@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     sii_fch_resol: str | None = None        # SII_FCH_RESOL
     sii_nro_resol: int | None = None        # SII_NRO_RESOL
 
+    # 🔐 JWT
+    jwt_secret_key: str = "CAMBIA_ESTA_CLAVE_SUPER_SECRETA"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 60
+
     # 👉 URL de la base de datos para SQLAlchemy
     @property
     def database_url(self) -> str:

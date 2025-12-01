@@ -4,6 +4,8 @@ from .emitter import Emitter
 from .document import Document, DocumentItem
 from .log_event import LogEvent
 from .caf import Caf
+from .user import User
+from .user_activity import UserActivity  
 
 __all__ = [
     "Base",
@@ -13,4 +15,6 @@ __all__ = [
     "DocumentItem",
     "LogEvent",
     "Caf",
+    "User",
+    "UserActivity",  
 ]

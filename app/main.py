@@ -6,6 +6,8 @@ from app.api.v1.routes_emitters import router as emitters_router
 from app.api.v1.routes_caf import router as caf_router
 from app.api.v1.routes_auth import router as auth_router  
 from app.api.v1.routes_audit import router as audit_router
+from app.api.v1.routes_incoming_documents import router as incoming_documents_router
+
 
 from app.db.session import Base, engine
 from app.core.config import get_settings
@@ -74,7 +76,8 @@ def health_check():
 
 # Routers
 app.include_router(auth_router, prefix="/api/v1")      
-app.include_router(audit_router, prefix="/api/v1")  
+app.include_router(audit_router, prefix="/api/v1") 
+app.include_router(incoming_documents_router, prefix="/api/v1")  
 app.include_router(emitters_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
 app.include_router(caf_router, prefix="/api/v1")

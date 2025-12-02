@@ -1,15 +1,17 @@
 # app/api/v1/routes_documents.py
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import PlainTextResponse
-from xml.dom import minidom
+from datetime import datetime
 from decimal import Decimal
+from xml.dom import minidom
 import logging
+from typing import Optional, List
 
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.core.security import get_current_client, get_current_user
-from app.core.audit_actions import AuditAction  # 👈 NUEVO
+from app.core.audit_actions import AuditAction
 from app.models.client import Client
 from app.models.user import User
 from app.models.document import Document, DocumentItem
@@ -22,6 +24,136 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
+
+# =====================================================
+# 1) LISTAR DOCUMENTOS EN JSON (NUEVO)
+# =====================================================
+@router.get("/", response_model=List[DocumentRead])
+def list_documents(
+    db: Session = Depends(get_db),
+    current_client: Client = Depends(get_current_client),
+    current_user: User = Depends(get_current_user),
+    emitter_id: Optional[int] = Query(None, description="Filtrar por id de emisor"),
+    tipo_dte: Optional[int] = Query(None, description="Filtrar por tipo de DTE (39, 33, etc.)"),
+    from_date: Optional[datetime] = Query(
+        None,
+        description="Filtrar desde esta fecha (usando created_at). Ej: 2025-11-01T00:00:00",
+    ),
+    to_date: Optional[datetime] = Query(
+        None,
+        description="Filtrar hasta esta fecha (usando created_at).",
+    ),
+    limit: int = Query(100, ge=1, le=1000, description="Cantidad máxima de documentos"),
+    offset: int = Query(0, ge=0, description="Desplazamiento para paginación"),
+):
+    """
+    Lista documentos emitidos por el cliente actual en JSON.
+    Este endpoint es el que debe usar el frontend para:
+    - mostrar las boletas/facturas emitidas
+    - hacer cálculos de ventas, IVA, etc.
+    """
+
+    q = db.query(Document).filter(Document.client_id == current_client.id)
+
+    if emitter_id is not None:
+        q = q.filter(Document.emitter_id == emitter_id)
+
+    if tipo_dte is not None:
+        q = q.filter(Document.tipo_dte == tipo_dte)
+
+    # Asumo que Document tiene created_at; si usas otro campo, cámbialo aquí:
+    if from_date is not None:
+        q = q.filter(Document.created_at >= from_date)  # ajusta si tu campo se llama distinto
+    if to_date is not None:
+        q = q.filter(Document.created_at <= to_date)
+
+    docs = (
+        q.order_by(Document.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    log_user_activity(
+        db,
+        user=current_user,
+        client=current_client,
+        action=AuditAction.LIST_DOCUMENTS,
+        path="/api/v1/documents",
+        method="GET",
+        status_code=status.HTTP_200_OK,
+        success=True,
+        extra={"count": len(docs)},
+    )
+
+    return docs
+
+
+# =====================================================
+# 2) (OPCIONAL) RESUMEN DE VENTAS / IVA (FIN DE MES)
+# =====================================================
+@router.get("/summary")
+def documents_summary(
+    db: Session = Depends(get_db),
+    current_client: Client = Depends(get_current_client),
+    current_user: User = Depends(get_current_user),
+    from_date: datetime = Query(..., description="Desde esta fecha (incluida)"),
+    to_date: datetime = Query(..., description="Hasta esta fecha (incluida)"),
+):
+    """
+    Devuelve un resumen simple de ventas en el rango dado:
+    - total_documentos
+    - suma_neto
+    - suma_iva
+    - suma_total
+
+    Con esto puedes calcular cuánto se vendió y cuánto IVA hay que pagar al SII
+    por periodo (ej: todo un mes).
+    """
+    q = (
+        db.query(Document)
+        .filter(
+            Document.client_id == current_client.id,
+            Document.created_at >= from_date,
+            Document.created_at <= to_date,
+        )
+    )
+
+    docs = q.all()
+
+    total_docs = len(docs)
+    suma_neto = sum(d.monto_neto or Decimal("0") for d in docs)
+    suma_iva = sum(d.monto_iva or Decimal("0") for d in docs)
+    suma_total = sum(d.monto_total or Decimal("0") for d in docs)
+
+    log_user_activity(
+        db,
+        user=current_user,
+        client=current_client,
+        action=AuditAction.LIST_DOCUMENTS,
+        path="/api/v1/documents/summary",
+        method="GET",
+        status_code=status.HTTP_200_OK,
+        success=True,
+        extra={
+            "total_docs": total_docs,
+            "suma_neto": str(suma_neto),
+            "suma_iva": str(suma_iva),
+            "suma_total": str(suma_total),
+        },
+    )
+
+    return {
+        "total_documents": total_docs,
+        "suma_neto": str(suma_neto),
+        "suma_iva": str(suma_iva),
+        "suma_total": str(suma_total),
+    }
+
+
+# =====================================================
+# 3) CREATE / GET / XML / ENVIO-XML (YA EXISTENTES)
+# =====================================================
 
 @router.post("/", response_model=DocumentRead, status_code=status.HTTP_201_CREATED)
 def create_document(
@@ -278,7 +410,6 @@ def get_document_xml(
             db,
             user=current_user,
             client=current_client,
-            # sigue siendo parte del flujo de GET_DOCUMENT_XML
             action=AuditAction.GET_DOCUMENT_XML,
             path=f"/api/v1/documents/{document_id}/xml",
             method="GET",

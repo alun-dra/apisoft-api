@@ -46,3 +46,10 @@ class AuditAction(str, Enum):
     API_RATE_LIMIT = "API_RATE_LIMIT"
     SERVER_ERROR = "SERVER_ERROR"
     INVALID_PAYLOAD = "INVALID_PAYLOAD"
+
+    # ============================
+    # DOCUMENTOS RECIBIDOS
+    # ============================
+    LIST_INCOMING_DTE = "LIST_INCOMING_DTE"
+    GET_INCOMING_DTE = "GET_INCOMING_DTE"
+    SYNC_INCOMING_DTE = "SYNC_INCOMING_DTE"
